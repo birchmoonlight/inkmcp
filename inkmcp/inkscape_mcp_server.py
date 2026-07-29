@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-Inkscape MCP Server
-Model Context Protocol server for controlling Inkscape via D-Bus extension
+Inkscape MCP Server (Pure-Python Fallback)
+Model Context Protocol server for controlling Inkscape via TCP transport.
 
-Provides access to Inkscape operations through a unified tool interface
-for SVG element creation, document manipulation, and code execution.
+Connects to the Rust MCP Server (inkmcpd) on 127.0.0.1:9999.
+For production use, run `inkmcpd` instead — this server is provided
+as a pure-Python alternative for development and testing.
 """
 
 import json
 import logging
 import os
-import subprocess
-import tempfile
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Optional, Union
 
 from mcp.server.fastmcp import FastMCP, Context
@@ -25,109 +23,108 @@ logging.basicConfig(
 )
 logger = logging.getLogger("InkscapeMCP")
 
-# Server configuration
-DEFAULT_DBUS_SERVICE = "org.inkscape.Inkscape"
-DEFAULT_DBUS_PATH = "/org/inkscape/Inkscape"
-DEFAULT_DBUS_INTERFACE = "org.gtk.Actions"
-DEFAULT_ACTION_NAME = "org.khema.inkscape.mcp"
+# Default TCP transport settings
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 9999
 
 
 class InkscapeConnection:
-    """Manages D-Bus connection to Inkscape"""
+    """Manages TCP transport connection to the Rust MCP server"""
 
-    def __init__(self):
-        self.dbus_service = DEFAULT_DBUS_SERVICE
-        self.dbus_path = DEFAULT_DBUS_PATH
-        self.dbus_interface = DEFAULT_DBUS_INTERFACE
-        self.action_name = DEFAULT_ACTION_NAME
-        self._client_path = Path(__file__).parent / "inkmcpcli.py"
+    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
+        self.host = host
+        self.port = port
+        self._transport = None
+
+    @property
+    def _tcp(self):
+        """Lazy import and connect to the TCP transport."""
+        if self._transport is None:
+            from transport import TcpTransport
+            self._transport = TcpTransport(self.host, self.port, connect=True)
+        return self._transport
+
+    def close(self):
+        if self._transport is not None:
+            try:
+                self._transport.disconnect()
+            except Exception:
+                pass
+            self._transport = None
 
     def is_available(self) -> bool:
-        """Check if Inkscape is running and MCP extension is available"""
+        """Check if the Rust MCP server is running and reachable."""
         try:
-            cmd = [
-                "gdbus",
-                "call",
-                "--session",
-                "--dest",
-                self.dbus_service,
-                "--object-path",
-                self.dbus_path,
-                "--method",
-                f"{self.dbus_interface}.List",
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-
-            if result.returncode != 0:
-                logger.warning("Inkscape D-Bus service not available")
-                return False
-
-            # Check if our generic MCP extension action is listed
-            output = result.stdout
-            return self.action_name in output
-
-        except Exception as e:
-            logger.error(f"Error checking Inkscape availability: {e}")
+            # Quick health check via TCP ping
+            import socket
+            s = socket.create_connection((self.host, self.port), timeout=2)
+            s.close()
+            return True
+        except Exception:
             return False
 
     def execute_operation(self, operation_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute operation using CLI client"""
+        """Execute operation via TCP transport to the Rust MCP server.
+
+        Args:
+            operation_data: Operation data dict with "tag", "attributes", etc.
+
+        Returns:
+            Response dict with "status" and "data" keys.
+        """
         try:
-            # Write operation data to temporary file
-            params_file = os.path.join(tempfile.gettempdir(), "mcp_params.json")
+            # Reconstruct command string from operation data
+            tag = operation_data.get("tag", "")
+            attributes = operation_data.get("attributes", {})
+            children = operation_data.get("children", [])
 
-            with open(params_file, "w") as f:
-                json.dump(operation_data, f)
+            parts = [tag]
+            for k, v in attributes.items():
+                if k in ("response_file", "children"):
+                    continue
+                sv = str(v)
+                if " " in sv or "'" in sv:
+                    parts.append(f'{k}="{sv}"')
+                else:
+                    parts.append(f"{k}={v}")
 
-            # Execute via D-Bus
-            cmd = [
-                "gdbus",
-                "call",
-                "--session",
-                "--dest",
-                self.dbus_service,
-                "--object-path",
-                self.dbus_path,
-                "--method",
-                f"{self.dbus_interface}.Activate",
-                self.action_name,
-                "[]",
-                "{}",
-            ]
+            if children:
+                parts.append(f"children={self._format_children(children)}")
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            command = " ".join(parts)
 
-            if result.returncode != 0:
-                logger.error(f"D-Bus command failed: {result.stderr}")
-                return {
-                    "status": "error",
-                    "data": {"error": f"D-Bus call failed: {result.stderr}"},
-                }
+            # Send via TCP
+            response = self._tcp.send_command(command)
 
-            # Read response from response file
-            response_file = operation_data.get("response_file")
-            if response_file and os.path.exists(response_file):
-                try:
-                    with open(response_file, "r") as f:
-                        response_data = json.load(f)
-                    os.remove(response_file)  # Clean up
-                    return response_data
-                except Exception as e:
-                    logger.error(f"Failed to read response file: {e}")
-                    return {
-                        "status": "error",
-                        "data": {"error": f"Response file error: {e}"},
-                    }
+            # Normalize response format (add "status" key for backward compat)
+            if response.get("success"):
+                data = response.get("data", {})
+                return {"status": "success", "data": data}
             else:
-                # Assume success if no response file specified
-                return {"status": "success", "data": {"message": "Operation completed"}}
+                data = response.get("data", {})
+                error = data.get("error", "Unknown error")
+                return {"status": "error", "data": {"error": error}}
 
-        except subprocess.TimeoutExpired:
-            logger.error("Operation timed out")
-            return {"status": "error", "data": {"error": "Operation timed out"}}
         except Exception as e:
             logger.error(f"Operation execution error: {e}")
             return {"status": "error", "data": {"error": str(e)}}
+
+    @staticmethod
+    def _format_children(children: list) -> str:
+        """Format children list as bracket syntax."""
+        items = []
+        for c in children:
+            tag = c.get("tag", "")
+            attrs = c.get("attributes", {})
+            sub = c.get("children", [])
+            astr = " ".join(
+                f'{k}="{v}"' if " " in str(v) else f"{k}={v}"
+                for k, v in attrs.items()
+            )
+            inner = f"children={InkscapeConnection._format_children(sub)}" if sub else ""
+            token = f"{{ {tag} {astr} {inner} }}" if (astr or inner) else f"{{ {tag} }}"
+            items.append(token)
+        return "[" + ", ".join(items) + "]"
 
 
 # Global connection instance
@@ -135,16 +132,22 @@ _inkscape_connection: Optional[InkscapeConnection] = None
 
 
 def get_inkscape_connection() -> InkscapeConnection:
-    """Get or create Inkscape connection"""
+    """Get or create TCP transport connection to the Rust MCP server"""
     global _inkscape_connection
 
-    if _inkscape_connection is None:
-        _inkscape_connection = InkscapeConnection()
+    if _inkscape_connection is not None:
+        return _inkscape_connection
+
+    _inkscape_connection = InkscapeConnection(
+        host=DEFAULT_HOST, port=DEFAULT_PORT
+    )
 
     if not _inkscape_connection.is_available():
         raise Exception(
-            "Inkscape is not running or generic MCP extension is not available. "
-            "Please start Inkscape and ensure the generic MCP extension is installed."
+            f"Cannot connect to inkmcpd at {DEFAULT_HOST}:{DEFAULT_PORT}. "
+            f"Make sure the Rust MCP Server is running.\n"
+            f"  Start it with: inkmcpd\n"
+            f"  Or: python -m inkmcp.run_inkscape_mcp"
         )
 
     return _inkscape_connection
@@ -153,21 +156,26 @@ def get_inkscape_connection() -> InkscapeConnection:
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     """Manage server startup and shutdown lifecycle"""
-    logger.info("Inkscape MCP server starting up")
+    logger.info("Inkscape MCP server (pure-Python fallback) starting up")
 
+    conn = None
     try:
         # Test connection on startup
         try:
-            get_inkscape_connection()
-            logger.info("Successfully connected to Inkscape on startup")
+            conn = get_inkscape_connection()
+            logger.info(
+                f"Connected to inkmcpd at {DEFAULT_HOST}:{DEFAULT_PORT}"
+            )
         except Exception as e:
-            logger.warning(f"Could not connect to Inkscape on startup: {e}")
+            logger.warning(f"Could not connect to inkmcpd on startup: {e}")
             logger.warning(
-                "Make sure Inkscape is running with the generic MCP extension before using tools"
+                "Make sure the Rust MCP Server (inkmcpd) is running before using tools"
             )
 
         yield {}
     finally:
+        if conn:
+            conn.close()
         logger.info("Inkscape MCP server shut down")
 
 
@@ -360,23 +368,13 @@ def inkscape_operation(ctx: Context, command: str) -> Union[str, ImageContent]:
     - Move entire tree: execute-code code="el = get_element_by_id('tree1'); el.set('transform', 'translate(50,0)') if el else None"
 
     """
-    response_file = None
     try:
         connection = get_inkscape_connection()
-
-        # Create unique response file for this operation
-        response_fd, response_file = tempfile.mkstemp(
-            suffix=".json", prefix="mcp_response_"
-        )
-        os.close(response_fd)
 
         # Parse the command string using the same logic as our client
         from inkmcpcli import parse_command_string
 
         parsed_data = parse_command_string(command)
-
-        # Add response file to the operation data
-        parsed_data["response_file"] = response_file
 
         logger.info(f"Executing command: {command}")
         logger.debug(f"Parsed data: {parsed_data}")
@@ -399,13 +397,6 @@ def inkscape_operation(ctx: Context, command: str) -> Union[str, ImageContent]:
     except Exception as e:
         logger.error(f"Error in inkscape_operation: {e}")
         return f"❌ Operation failed: {str(e)}"
-    finally:
-        # Clean up response file if it exists
-        if response_file and os.path.exists(response_file):
-            try:
-                os.remove(response_file)
-            except OSError:
-                pass
 
 
 def main():

@@ -610,16 +610,11 @@ def parse_attributes(param_str: str) -> Dict[str, Any]:
 
 
 class InkscapeClient:
-    """D-Bus client for SVG element creation"""
+    """Cross-platform client for SVG element creation via TCP transport"""
 
-    def __init__(self):
-        self.dbus_service = "org.inkscape.Inkscape"
-        self.dbus_path = "/org/inkscape/Inkscape"
-        self.dbus_interface = "org.gtk.Actions"
-        self.action_name = "org.khema.inkscape.mcp"
-
-
-
+    def __init__(self, host: str = "127.0.0.1", port: int = 9999):
+        self.host = host
+        self.port = port
 
     def build_element_data(self, tag: str, param_str: str) -> Dict[str, Any]:
         """
@@ -638,62 +633,58 @@ class InkscapeClient:
         return result if result is not None else {"tag": tag, "attributes": {}}
 
     def execute_command(self, element_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute command via D-Bus"""
+        """Execute command via TCP transport to the Rust MCP server"""
         try:
-            # Create temporary response file for reverse communication (like original system)
-            response_fd, response_file = tempfile.mkstemp(suffix='.json', prefix='inkmcp_response_')
-            os.close(response_fd)  # Close the file descriptor, we just need the path
-            element_data['response_file'] = response_file
+            # Reconstruct the command string from parsed element_data
+            command = self._element_data_to_command(element_data)
 
-            # Write parameters to fixed JSON file (like original system)
-            params_file = os.path.join(tempfile.gettempdir(), "mcp_params.json")
-            with open(params_file, 'w') as f:
-                json.dump(element_data, f)
+            # Send via TCP transport
+            from transport import send_command as tcpsend
 
-            # Execute D-Bus command (like original system)
-            cmd = [
-                "gdbus", "call",
-                "--session",
-                "--dest", self.dbus_service,
-                "--object-path", self.dbus_path,
-                "--method", f"{self.dbus_interface}.Activate",
-                self.action_name,
-                "[]", "{}"
-            ]
+            response = tcpsend(command, self.host, self.port)
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            return {"success": response.get("success", False), "response": response}
 
-            if result.returncode != 0:
-                return {
-                    "success": False,
-                    "error": f"D-Bus command failed: {result.stderr}"
-                }
-
-            # Read response from response file (like original system)
-            if os.path.exists(response_file):
-                try:
-                    with open(response_file, 'r') as f:
-                        response = json.load(f)
-                    os.remove(response_file)
-                    return {"success": True, "response": response}
-                except Exception as e:
-                    return {
-                        "success": False,
-                        "error": f"Failed to read response: {str(e)}"
-                    }
-
-            return {"success": True, "output": result.stdout}
-
-        except subprocess.TimeoutExpired:
-            return {
-                "success": False,
-                "error": "Command timed out after 30 seconds"
-            }
         except Exception as e:
-            return {
-                "success": False,
-                "error": f"Execution failed: {str(e)}"
-            }
+            return {"success": False, "error": f"Execution failed: {str(e)}"}
+
+    def _element_data_to_command(self, element_data: Dict[str, Any]) -> str:
+        """Convert parsed element_data back to a command string for TCP transport."""
+        tag = element_data.get("tag", "")
+        attributes = element_data.get("attributes", {})
+        children = element_data.get("children", [])
+        parts = [tag]
+
+        for k, v in attributes.items():
+            if k == "children":
+                continue
+            sv = str(v)
+            if " " in sv or "'" in sv:
+                parts.append(f'{k}="{sv}"')
+            else:
+                parts.append(f"{k}={sv}")
+
+        if children:
+            parts.append(f"children={self._fmt_children(children)}")
+
+        return " ".join(parts)
+
+    @staticmethod
+    def _fmt_children(children: list) -> str:
+        """Format children list as bracket syntax for command string."""
+        items = []
+        for c in children:
+            tag = c.get("tag", "")
+            attrs = c.get("attributes", {})
+            sub = c.get("children", [])
+            astr = " ".join(
+                f'{k}="{v}"' if " " in str(v) else f"{k}={v}"
+                for k, v in attrs.items()
+            )
+            inner = f"children={InkscapeClient._fmt_children(sub)}" if sub else ""
+            token = f"{{ {tag} {astr} {inner} }}" if (astr or inner) else f"{{ {tag} }}"
+            items.append(token)
+        return "[" + ", ".join(items) + "]"
 
     def format_response(self, result: Dict[str, Any], tag: str = "") -> str:
         """Format the response for display - minimal output by default"""

@@ -1,4 +1,4 @@
-name: Create Release
+name: Build & Release
 
 on:
   push:
@@ -6,7 +6,68 @@ on:
       - "*"
 
 jobs:
-  build:
+  # ── Build Rust MCP Server (cross-platform matrix) ───────────────
+  build-rust:
+    name: Build inkmcpd (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: ""
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            suffix: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            suffix: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: ".exe"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation dependencies (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build Rust binary
+        run: |
+          cd server
+          cargo build --release --target ${{ matrix.target }}
+          cd ..
+
+      - name: Strip binary (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          strip server/target/${{ matrix.target }}/release/inkmcpd${{ matrix.suffix }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkmcpd-${{ matrix.target }}
+          path: server/target/${{ matrix.target }}/release/inkmcpd${{ matrix.suffix }}
+          if-no-files-found: error
+
+  # ── Package extension zip ───────────────────────────────────────
+  package:
+    name: Package inkmcp-extension
+    needs: build-rust
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -14,40 +75,136 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Create Plugin Zip
-        run: |
-          # Create a temporary directory for the package
-          mkdir -p package
+      - name: Download all Rust binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: inkmcpd-*
+          path: downloaded-binaries
+          merge-multiple: true
 
-          # Copy the main extension files
+      - name: Organize binaries and build packages
+        run: |
+          # Create the base package directory
+          mkdir -p package/inkmcp
+
+          # ── Copy Python extension files ──
           cp inkscape_mcp.inx package/
           cp inkscape_mcp.py package/
+          cp -r inkmcp/ package/inkmcp/
+          # Remove any existing venv from package
+          rm -rf package/inkmcp/venv
 
-          # Copy the entire inkmcp subfolder maintaining structure
-          cp -r inkmcp package/
+          # ── Copy Rust binaries (each platform gets its own package) ──
+          for binary in downloaded-binaries/*; do
+            case "$binary" in
+              *linux*)
+                PLATFORM_DIR="linux"
+                cp "$binary" "package/inkmcpd"
+                ;;
+              *x86_64-apple-darwin*)
+                PLATFORM_DIR="macos-x64"
+                cp "$binary" "package/inkmcpd"
+                ;;
+              *aarch64-apple-darwin*)
+                PLATFORM_DIR="macos-arm64"
+                cp "$binary" "package/inkmcpd"
+                ;;
+              *windows*)
+                PLATFORM_DIR="windows"
+                cp "$binary" "package/inkmcpd.exe"
+                ;;
+            esac
+          done
 
-          # Create the zip file
+          echo "Package contents:"
+          find package -type f | sort
+
+      - name: Create Platform-Specific Archives
+        run: |
           cd package
-          zip -r ../inkmcp-extension.zip .
+
+          # Linux (x86_64) archive
+          mkdir -p ../archives/linux
+          cp -r . ../archives/linux/
+          cd ../archives/linux
+          rm -f inkmcpd.exe
+          chmod +x inkmcpd 2>/dev/null || true
+          zip -r ../../inkmcp-linux-x86_64.zip . 2>/dev/null
+          cd ../..
+
+          # macOS (x86_64) archive
+          mkdir -p archives/macos-x64
+          cp -r package/* archives/macos-x64/
+          cd archives/macos-x64
+          rm -f inkmcpd.exe
+          chmod +x inkmcpd 2>/dev/null || true
+          zip -r ../../inkmcp-macos-x86_64.zip . 2>/dev/null
+          cd ../..
+
+          # macOS (ARM64) archive
+          mkdir -p archives/macos-arm64
+          cp -r package/* archives/macos-arm64/
+          cd archives/macos-arm64
+          rm -f inkmcpd.exe
+          chmod +x inkmcpd 2>/dev/null || true
+          zip -r ../../inkmcp-macos-arm64.zip . 2>/dev/null
+          cd ../..
+
+          # Windows archive
+          mkdir -p archives/windows
+          cp -r package/* archives/windows/
+          cd archives/windows
+          rm -f inkmcpd
+          zip -r ../../inkmcp-windows-x86_64.zip . 2>/dev/null
+          cd ../..
+
+          # Legacy cross-platform archive (all files, no binaries)
+          cd package
+          rm -f inkmcpd inkmcpd.exe
+          zip -r ../inkmcp-extension.zip . 2>/dev/null
           cd ..
+
+          echo "Generated archives:"
+          ls -la inkmcp-*.zip
 
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v2
         with:
-          name: Latest Development Build
+          name: "Inkmcp v${{ github.ref_name }}"
           body: |
-            This release contains the latest development builds of the Inkscape MCP plugin.
+            ## Cross-Platform Release 🎉
 
-            ## Installation
-            1. Download `inkmcp-extension.zip`
-            2. Extract it to your Inkscape extensions directory: `~/.config/inkscape/extensions/` (Linux)
-            3. Restart Inkscape
-            4. The extension will appear under Extensions > MCP
+            This release includes the native Rust MCP Server binary for each platform,
+            plus the legacy pure-Python extension package.
+
+            ### Platform Downloads
+
+            | Platform | Architecture | Download |
+            |----------|-------------|----------|
+            | **Linux** | x86_64 | `inkmcp-linux-x86_64.zip` |
+            | **macOS** | Intel | `inkmcp-macos-x86_64.zip` |
+            | **macOS** | Apple Silicon | `inkmcp-macos-arm64.zip` |
+            | **Windows** | x86_64 | `inkmcp-windows-x86_64.zip` |
+            | **All (Python-only)** | Cross-platform | `inkmcp-extension.zip` |
+
+            ### Quick Start
+            1. Extract the archive for your platform
+            2. Extract to your Inkscape extensions directory
+            3. Start Inkscape (or run `inkmcpd` standalone)
+            4. Configure your AI tool to use `run_inkscape_mcp.sh` (Linux/macOS) or `run_inkscape_mcp.bat` (Windows)
+
+            ### New Architecture
+            - **Rust MCP Server** (`inkmcpd`): Native binary handling MCP protocol + TCP transport
+            - **Python Worker**: Inkscape SVG operations via inkex (unchanged)
+            - **No D-Bus required** — works on Windows, macOS, and Linux
           draft: false
           prerelease: true
           files: |
+            inkmcp-linux-x86_64.zip
+            inkmcp-macos-x86_64.zip
+            inkmcp-macos-arm64.zip
+            inkmcp-windows-x86_64.zip
             inkmcp-extension.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-

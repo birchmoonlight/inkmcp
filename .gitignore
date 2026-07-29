@@ -1,2 +1,14 @@
 internal/
 .claude/
+server/target/
+*.pyc
+__pycache__/
+venv/
+.env
+.DS_Store
+# Stray binaries (not part of the project)
+inkmcpd
+# Test scripts for local verification (not part of the project)
+test_full.py
+test_tcp.py
+test_mcp.py
