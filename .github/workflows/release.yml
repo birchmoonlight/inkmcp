@@ -57,7 +57,12 @@ jobs:
       - name: Strip binary (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
-          strip server/target/${{ matrix.target }}/release/inkmcpd${{ matrix.suffix }}
+          BINARY="server/target/${{ matrix.target }}/release/inkmcpd${{ matrix.suffix }}"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            aarch64-linux-gnu-strip "$BINARY"
+          else
+            strip "$BINARY"
+          fi
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
