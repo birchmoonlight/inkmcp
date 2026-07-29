@@ -2,6 +2,8 @@ name: Build & Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "*"
 
@@ -84,84 +86,82 @@ jobs:
 
       - name: Organize binaries and build packages
         run: |
-          # Create the base package directory
-          mkdir -p package/inkmcp
+          # ── Create per-platform package directories ──
+          PLATFORMS="linux-x86_64 linux-arm64 macos-x86_64 macos-arm64 windows-x86_64"
+          for plat in $PLATFORMS; do
+            mkdir -p "package-${plat}/inkmcp"
+          done
 
-          # ── Copy Python extension files ──
-          cp inkscape_mcp.inx package/
-          cp inkscape_mcp.py package/
-          cp -r inkmcp/ package/inkmcp/
-          # Remove any existing venv from package
-          rm -rf package/inkmcp/venv
+          # ── Copy shared Python extension files into each platform package ──
+          for plat in $PLATFORMS; do
+            cp inkscape_mcp.inx "package-${plat}/"
+            cp inkscape_mcp.py "package-${plat}/"
+            cp -r inkmcp/ "package-${plat}/inkmcp/"
+            rm -rf "package-${plat}/inkmcp/venv"
+          done
 
-          # ── Copy Rust binaries (each platform gets its own package) ──
+          # ── Place each Rust binary into its correct platform package ──
           for binary in downloaded-binaries/*; do
             case "$binary" in
-              *linux*)
-                PLATFORM_DIR="linux"
-                cp "$binary" "package/inkmcpd"
+              *x86_64-unknown-linux-gnu*)
+                cp "$binary" "package-linux-x86_64/inkmcpd"
+                chmod +x "package-linux-x86_64/inkmcpd"
+                ;;
+              *aarch64-unknown-linux-gnu*)
+                cp "$binary" "package-linux-arm64/inkmcpd"
+                chmod +x "package-linux-arm64/inkmcpd"
                 ;;
               *x86_64-apple-darwin*)
-                PLATFORM_DIR="macos-x64"
-                cp "$binary" "package/inkmcpd"
+                cp "$binary" "package-macos-x86_64/inkmcpd"
+                chmod +x "package-macos-x86_64/inkmcpd"
                 ;;
               *aarch64-apple-darwin*)
-                PLATFORM_DIR="macos-arm64"
-                cp "$binary" "package/inkmcpd"
+                cp "$binary" "package-macos-arm64/inkmcpd"
+                chmod +x "package-macos-arm64/inkmcpd"
                 ;;
               *windows*)
-                PLATFORM_DIR="windows"
-                cp "$binary" "package/inkmcpd.exe"
+                cp "$binary" "package-windows-x86_64/inkmcpd.exe"
                 ;;
             esac
           done
 
           echo "Package contents:"
-          find package -type f | sort
+          for plat in $PLATFORMS; do
+            echo "--- $plat ---"
+            find "package-${plat}" -type f | sort
+          done
 
       - name: Create Platform-Specific Archives
         run: |
-          cd package
+          cd package-linux-x86_64
+          zip -r ../inkmcp-linux-x86_64.zip .
+          cd ..
 
-          # Linux (x86_64) archive
-          mkdir -p ../archives/linux
-          cp -r . ../archives/linux/
-          cd ../archives/linux
+          cd package-linux-arm64
           rm -f inkmcpd.exe
-          chmod +x inkmcpd 2>/dev/null || true
-          zip -r ../../inkmcp-linux-x86_64.zip . 2>/dev/null
-          cd ../..
+          zip -r ../inkmcp-linux-arm64.zip .
+          cd ..
 
-          # macOS (x86_64) archive
-          mkdir -p archives/macos-x64
-          cp -r package/* archives/macos-x64/
-          cd archives/macos-x64
-          rm -f inkmcpd.exe
-          chmod +x inkmcpd 2>/dev/null || true
-          zip -r ../../inkmcp-macos-x86_64.zip . 2>/dev/null
-          cd ../..
+          cd package-macos-x86_64
+          zip -r ../inkmcp-macos-x86_64.zip .
+          cd ..
 
-          # macOS (ARM64) archive
-          mkdir -p archives/macos-arm64
-          cp -r package/* archives/macos-arm64/
-          cd archives/macos-arm64
-          rm -f inkmcpd.exe
-          chmod +x inkmcpd 2>/dev/null || true
-          zip -r ../../inkmcp-macos-arm64.zip . 2>/dev/null
-          cd ../..
+          cd package-macos-arm64
+          zip -r ../inkmcp-macos-arm64.zip .
+          cd ..
 
-          # Windows archive
-          mkdir -p archives/windows
-          cp -r package/* archives/windows/
-          cd archives/windows
-          rm -f inkmcpd
-          zip -r ../../inkmcp-windows-x86_64.zip . 2>/dev/null
-          cd ../..
+          cd package-windows-x86_64
+          zip -r ../inkmcp-windows-x86_64.zip .
+          cd ..
 
-          # Legacy cross-platform archive (all files, no binaries)
-          cd package
-          rm -f inkmcpd inkmcpd.exe
-          zip -r ../inkmcp-extension.zip . 2>/dev/null
+          # Legacy cross-platform archive (files only, no binaries)
+          mkdir -p package-legacy
+          cp inkscape_mcp.inx package-legacy/
+          cp inkscape_mcp.py package-legacy/
+          cp -r inkmcp/ package-legacy/inkmcp/
+          rm -rf package-legacy/inkmcp/venv
+          cd package-legacy
+          zip -r ../inkmcp-extension.zip .
           cd ..
 
           echo "Generated archives:"
@@ -183,6 +183,7 @@ jobs:
             | Platform | Architecture | Download |
             |----------|-------------|----------|
             | **Linux** | x86_64 | `inkmcp-linux-x86_64.zip` |
+            | **Linux** | ARM64 | `inkmcp-linux-arm64.zip` |
             | **macOS** | Intel | `inkmcp-macos-x86_64.zip` |
             | **macOS** | Apple Silicon | `inkmcp-macos-arm64.zip` |
             | **Windows** | x86_64 | `inkmcp-windows-x86_64.zip` |
@@ -202,6 +203,7 @@ jobs:
           prerelease: true
           files: |
             inkmcp-linux-x86_64.zip
+            inkmcp-linux-arm64.zip
             inkmcp-macos-x86_64.zip
             inkmcp-macos-arm64.zip
             inkmcp-windows-x86_64.zip
